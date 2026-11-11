@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "name": "OHM Lookup for QLever",
+  "version": "1.0",
+  "description": "Adds a lookup button next to OHM URIs on qlever.dev/ohm-planet and a TTL link in the title on openhistoricalmap.org.",
+
+  "content_scripts": [
+    {
+      "matches": [
+        "*://qlever.dev/ohm-planet*",
+        "*://www.openhistoricalmap.org/*",
+        "*://openhistoricalmap.org/*"
+      ],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "permissions": [
+    "*://qlever.dev/*",
+    "activeTab"
+  ]
+}
