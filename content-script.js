@@ -78,7 +78,8 @@ async function fetchTurtle(query) {
 }
 
 // ------------------------------------------------------------
-//  3. Beautify Turtle: shorten IRIs + only used PREFIXes
+//  3. Parse Turtle and build a display model
+//     (shortened IRIs, used prefixes, predicate groups)
 // ------------------------------------------------------------
 function shortenIri(iri, used) {
   for (const [pfx, base] of PREFIXES_BY_LEN) {
@@ -93,31 +94,85 @@ function shortenIri(iri, used) {
   return `<${iri}>`;
 }
 
-function beautifyTurtle(raw) {
+// Only shorten real IRI terms (<...>); leave literals / blank nodes untouched.
+function shortenTerm(term, used) {
+  if (term.length >= 2 && term.startsWith("<") && term.endsWith(">")) {
+    return shortenIri(term.slice(1, -1), used);
+  }
+  return term;
+}
+
+// QLever emits one triple per line:  <s> <p> <o> .
+function parseTriples(raw) {
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#") || /^@?prefix\b/i.test(t)) continue;
+    const m = t.match(/^(\S+)\s+(<[^>]*>)\s+(.*?)\s*\.\s*$/);
+    if (m) out.push({ s: m[1], p: m[2], o: m[3] });
+    else out.push({ raw: t }); // unparsed line (kept verbatim)
+  }
+  return out;
+}
+
+function buildModel(raw) {
+  const triples = parseTriples(raw);
   const used = new Set();
-  const body = raw
-    .replace(/<([^<>"{}|^`\\\x00-\x20]*)>/g, (_, iri) => shortenIri(iri, used))
-    .trim();
+
+  const items = triples.map((t) => {
+    if (t.raw !== undefined) return { raw: t.raw };
+    return {
+      s: shortenTerm(t.s, used),
+      p: shortenTerm(t.p, used),
+      o: shortenTerm(t.o, used),
+    };
+  });
+
+  const lineOf = (it) =>
+    it.raw !== undefined ? it.raw : `${it.s} ${it.p} ${it.o} .`;
 
   const header = PREFIXES
     .filter(([pfx]) => used.has(pfx))
     .map(([pfx, base]) => `PREFIX ${pfx} <${base}>`)
     .join("\n");
+  const head = header ? header + "\n\n" : "";
 
-  return (header ? header + "\n\n" : "") + body + "\n";
+  // Pretty (original order)
+  const pretty = head + items.map(lineOf).join("\n") + "\n";
+
+  // Group by predicate, sorted by predicate
+  const map = new Map();
+  for (const it of items) {
+    const key = it.p || "(other)";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(it);
+  }
+  const groups = [...map.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([p, arr]) => ({ p, count: arr.length, lines: arr.map(lineOf) }));
+
+  // Grouped text (for copy), predicate-sorted
+  const grouped = head + groups.flatMap((g) => g.lines).join("\n") + "\n";
+
+  return { pretty, grouped, groups };
 }
 
 // ------------------------------------------------------------
-//  4. Show Turtle in a new tab (toggle + copy)
+//  4. Show Turtle in a new tab (Raw / Pretty / Grouped + copy)
 // ------------------------------------------------------------
 function escapeHtml(s) {
   return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 }
 
 function openTtlInNewTab(rawTtl, title = "OHM-TTL") {
-  const pretty = beautifyTurtle(rawTtl);
-  const json = JSON.stringify({ title, raw: rawTtl, pretty })
-    .replace(/<\//g, "<\\/");
+  const model = buildModel(rawTtl);
+  const json = JSON.stringify({
+    title,
+    raw: rawTtl,
+    pretty: model.pretty,
+    grouped: model.grouped,
+    groups: model.groups,
+  }).replace(/<\//g, "<\\/");
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -135,32 +190,103 @@ function openTtlInNewTab(rawTtl, title = "OHM-TTL") {
   header button { background: #3a3a3a; color: #ddd; border: 1px solid #555;
                   border-radius: 5px; padding: 3px 9px; cursor: pointer; font-size: 12px; }
   header button:hover { background: #4a4a4a; }
+  .seg { display: inline-flex; border: 1px solid #555; border-radius: 5px; overflow: hidden; }
+  .seg button { background: #2d2d2d; border: none; border-radius: 0; }
+  .seg button.active { background: #0a66c2; color: #fff; }
   pre { margin: 0; padding: 12px; white-space: pre; overflow: auto; line-height: 1.45; }
+  #groups { padding: 8px 12px; }
+  .group { border: 1px solid #333; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
+  .grouphead { display: flex; align-items: center; gap: 8px; padding: 5px 9px; cursor: pointer;
+               background: #2a2a2a; font-family: system-ui, sans-serif; font-size: 12px;
+               user-select: none; }
+  .grouphead:hover { background: #333; }
+  .grouphead .toggle { display: inline-block; width: 12px; text-align: center;
+                       font-weight: 700; color: #9cdcfe; }
+  .grouphead .pred { color: #ce9178; }
+  .grouphead .count { color: #888; }
+  .groupbody { margin: 0; padding: 8px 12px; border-top: 1px solid #333; }
 </style>
 </head>
 <body>
 <header>
   <span class="title">${escapeHtml(title)}</span>
+  <span class="seg">
+    <button data-mode="pretty" class="active">Pretty</button>
+    <button data-mode="grouped">Grouped</button>
+    <button data-mode="raw">Raw</button>
+  </span>
   <span class="info" id="info"></span>
-  <button id="toggle">Show raw</button>
   <button id="copy">Copy</button>
 </header>
 <pre id="ttl"></pre>
+<div id="groups" hidden></div>
 <script>
 const DATA = ${json};
-let showRaw = false;
-const pre  = document.getElementById("ttl");
+const pre = document.getElementById("ttl");
+const groupsBox = document.getElementById("groups");
 const info = document.getElementById("info");
-const toggle = document.getElementById("toggle");
-function render() {
-  const txt = showRaw ? DATA.raw : DATA.pretty;
-  pre.textContent = txt;
-  info.textContent = (showRaw ? "Raw" : "With prefixes") + " · " + txt.length + " chars";
-  toggle.textContent = showRaw ? "Show pretty" : "Show raw";
+let mode = "pretty";
+let groupsBuilt = false;
+
+function buildGroups() {
+  if (groupsBuilt) return;
+  groupsBuilt = true;
+  for (const g of DATA.groups) {
+    const wrap = document.createElement("div");
+    wrap.className = "group";
+    const head = document.createElement("div");
+    head.className = "grouphead";
+    const tog = document.createElement("span");
+    tog.className = "toggle";
+    tog.textContent = "\\u2212";
+    const pred = document.createElement("span");
+    pred.className = "pred";
+    pred.textContent = g.p;
+    const cnt = document.createElement("span");
+    cnt.className = "count";
+    cnt.textContent = " (" + g.count + ")";
+    head.append(tog, pred, cnt);
+    const body = document.createElement("pre");
+    body.className = "groupbody";
+    body.textContent = g.lines.join("\\n");
+    head.addEventListener("click", () => {
+      body.hidden = !body.hidden;
+      tog.textContent = body.hidden ? "+" : "\\u2212";
+    });
+    wrap.append(head, body);
+    groupsBox.appendChild(wrap);
+  }
 }
-toggle.onclick = () => { showRaw = !showRaw; render(); };
+
+function currentText() {
+  if (mode === "raw") return DATA.raw;
+  if (mode === "grouped") return DATA.grouped;
+  return DATA.pretty;
+}
+
+function render() {
+  document.querySelectorAll(".seg button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.mode === mode));
+  if (mode === "grouped") {
+    buildGroups();
+    pre.hidden = true;
+    groupsBox.hidden = false;
+  } else {
+    groupsBox.hidden = true;
+    pre.hidden = false;
+    pre.textContent = mode === "raw" ? DATA.raw : DATA.pretty;
+  }
+  const label = mode === "raw" ? "Raw"
+              : mode === "grouped" ? "Grouped by predicate"
+              : "With prefixes";
+  info.textContent = label + " \\u00b7 " + currentText().length + " chars";
+}
+
+document.querySelectorAll(".seg button").forEach((b) =>
+  b.addEventListener("click", () => { mode = b.dataset.mode; render(); }));
+
 document.getElementById("copy").onclick = async () => {
-  const txt = pre.textContent;
+  const txt = currentText();
   try { await navigator.clipboard.writeText(txt); }
   catch {
     const ta = document.createElement("textarea");
@@ -170,6 +296,7 @@ document.getElementById("copy").onclick = async () => {
   const b = document.getElementById("copy");
   b.textContent = "Copied!"; setTimeout(() => (b.textContent = "Copy"), 1200);
 };
+
 render();
 </script>
 </body>
